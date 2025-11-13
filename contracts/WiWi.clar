@@ -29,41 +29,47 @@
 (define-constant ERR_SUBSCRIPTION_EXISTS (err u111))
 
 ;; Data maps
-(define-map subscriptions principal
-  { expiry: uint, rate: uint, receiver: principal })
+(define-map subscriptions uint
+  { subscriber: principal, receiver: principal, expiry: uint, rate: uint })
+(define-map subscription-index
+  { subscriber: principal, receiver: principal } uint)
 
 ;; New Security Data Maps
 (define-map authorized-operators principal bool)
 (define-map user-subscription-count principal uint)
-(define-map rate-change-history principal uint) ;; Last rate change block
+(define-map rate-change-history uint uint) ;; Last rate change block per subscription
 
 ;; Contract State Variables
 (define-data-var contract-paused bool false)
 (define-data-var pause-end-block uint u0)
 (define-data-var total-volume uint u0)
+(define-data-var next-subscription-id uint u1)
 
 ;; Events
-(define-private (log-subscription-created (subscriber principal) (receiver principal) (rate uint) (expiry uint))
+(define-private (log-subscription-created (subscription-id uint) (subscriber principal) (receiver principal) (rate uint) (expiry uint))
   (print {
     event: "subscription-created",
+    subscription-id: subscription-id,
     subscriber: subscriber,
     receiver: receiver,
     rate: rate,
     expiry: expiry
   }))
 
-(define-private (log-subscription-renewed (subscriber principal) (receiver principal) (rate uint) (new-expiry uint))
+(define-private (log-subscription-renewed (subscription-id uint) (subscriber principal) (receiver principal) (rate uint) (new-expiry uint))
   (print {
     event: "subscription-renewed",
+    subscription-id: subscription-id,
     subscriber: subscriber,
     receiver: receiver,
     rate: rate,
     new-expiry: new-expiry
   }))
 
-(define-private (log-subscription-cancelled (subscriber principal) (cancelled-by principal))
+(define-private (log-subscription-cancelled (subscription-id uint) (subscriber principal) (cancelled-by principal))
   (print {
     event: "subscription-cancelled",
+    subscription-id: subscription-id,
     subscriber: subscriber,
     cancelled-by: cancelled-by
   }))
@@ -80,7 +86,9 @@
 ;; Enhanced subscription function with security checks
 (define-public (subscribe (receiver principal) (rate uint) (period uint))
   (let ((expiry (+ stacks-block-height period))
-        (current-user-subs (default-to u0 (map-get? user-subscription-count tx-sender))))
+        (current-user-subs (default-to u0 (map-get? user-subscription-count tx-sender)))
+        (existing-subscription (map-get? subscription-index { subscriber: tx-sender, receiver: receiver }))
+        (subscription-id (var-get next-subscription-id)))
     (begin
       ;; Security checks
       (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
@@ -92,7 +100,7 @@
       (asserts! (<= rate MAX_RATE) ERR_RATE_TOO_HIGH)
       
       ;; Check if subscription already exists
-      (asserts! (is-none (map-get? subscriptions tx-sender)) ERR_SUBSCRIPTION_EXISTS)
+      (asserts! (is-none existing-subscription) ERR_SUBSCRIPTION_EXISTS)
       
       ;; Make initial payment - must succeed
       (unwrap! (stx-transfer? rate tx-sender receiver) ERR_TRANSFER_FAILED)
@@ -101,30 +109,35 @@
       (var-set total-volume (+ (var-get total-volume) rate))
       
       ;; Store subscription
-      (map-set subscriptions tx-sender { 
+      (map-set subscriptions subscription-id { 
+        subscriber: tx-sender,
+        receiver: receiver,
         expiry: expiry, 
-        rate: rate, 
-        receiver: receiver 
+        rate: rate 
       })
+      (map-set subscription-index { subscriber: tx-sender, receiver: receiver } subscription-id)
       
       ;; Update user subscription count
       (map-set user-subscription-count tx-sender (+ current-user-subs u1))
+      (var-set next-subscription-id (+ subscription-id u1))
       
       ;; Log event
-      (log-subscription-created tx-sender receiver rate expiry)
+      (log-subscription-created subscription-id tx-sender receiver rate expiry)
       
-      (ok true))))
+      (ok subscription-id))))
 
 ;; Original renew function with security enhancements
-(define-public (renew)
-  (let ((sub (unwrap! (map-get? subscriptions tx-sender) ERR_NO_SUBSCRIPTION)))
-    (let ((expiry (get expiry sub)) 
+(define-public (renew (subscription-id uint))
+  (let ((sub (unwrap! (map-get? subscriptions subscription-id) ERR_NO_SUBSCRIPTION)))
+    (let ((subscriber (get subscriber sub))
+          (expiry (get expiry sub)) 
           (rate (get rate sub)) 
           (receiver (get receiver sub))
           (new-expiry (+ stacks-block-height RENEWAL_PERIOD)))
       (begin
         ;; Security check
         (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (is-eq subscriber tx-sender) ERR_UNAUTHORIZED)
         
         ;; Check if subscription has expired
         (asserts! (>= stacks-block-height expiry) ERR_NOT_EXPIRED)
@@ -136,39 +149,45 @@
         (var-set total-volume (+ (var-get total-volume) rate))
         
         ;; Update subscription
-        (map-set subscriptions tx-sender { 
+        (map-set subscriptions subscription-id { 
+          subscriber: subscriber,
+          receiver: receiver,
           expiry: new-expiry, 
-          rate: rate, 
-          receiver: receiver 
+          rate: rate 
         })
         
         ;; Log event
-        (log-subscription-renewed tx-sender receiver rate new-expiry)
+        (log-subscription-renewed subscription-id subscriber receiver rate new-expiry)
         
         (ok true)))))
 
 ;; New function to change subscription rate with security
-(define-public (change-subscription-rate (new-rate uint))
-  (let ((sub (unwrap! (map-get? subscriptions tx-sender) ERR_NO_SUBSCRIPTION))
-        (last-change (default-to u0 (map-get? rate-change-history tx-sender))))
+(define-public (change-subscription-rate (subscription-id uint) (new-rate uint))
+  (let ((sub (unwrap! (map-get? subscriptions subscription-id) ERR_NO_SUBSCRIPTION)))
     (begin
       ;; Security checks
       (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+      (asserts! (is-eq (get subscriber sub) tx-sender) ERR_UNAUTHORIZED)
       (asserts! (>= new-rate MIN_RATE) ERR_INSUFFICIENT_RATE)
       (asserts! (<= new-rate MAX_RATE) ERR_RATE_TOO_HIGH)
       
       ;; Check cooldown period
-      (asserts! (>= stacks-block-height (+ last-change RATE_CHANGE_COOLDOWN)) ERR_RATE_CHANGE_COOLDOWN)
+      (let ((cooldown-ok
+              (match (map-get? rate-change-history subscription-id)
+                last-change (>= stacks-block-height (+ last-change RATE_CHANGE_COOLDOWN))
+                true)))
+        (asserts! cooldown-ok ERR_RATE_CHANGE_COOLDOWN))
       
       ;; Update subscription with new rate
-      (map-set subscriptions tx-sender {
+      (map-set subscriptions subscription-id {
+        subscriber: (get subscriber sub),
+        receiver: (get receiver sub),
         expiry: (get expiry sub),
-        rate: new-rate,
-        receiver: (get receiver sub)
+        rate: new-rate
       })
       
       ;; Record rate change
-      (map-set rate-change-history tx-sender stacks-block-height)
+      (map-set rate-change-history subscription-id stacks-block-height)
       
       ;; Log security event
       (log-security-event "rate-changed" "subscription-rate-updated")
@@ -217,18 +236,19 @@
     (ok true)))
 
 ;; Admin function to cancel any subscription (enhanced)
-(define-public (admin-cancel-subscription (subscriber principal))
-  (let ((current-count (default-to u0 (map-get? user-subscription-count subscriber))))
+(define-public (admin-cancel-subscription (subscription-id uint))
+  (let ((sub (unwrap! (map-get? subscriptions subscription-id) ERR_NO_SUBSCRIPTION))
+        (subscriber (get subscriber sub))
+        (receiver (get receiver sub))
+        (current-count (default-to u0 (map-get? user-subscription-count subscriber))))
     (begin
       ;; Only contract owner or authorized operators can cancel subscriptions
       (asserts! (or (is-eq tx-sender CONTRACT_OWNER)
                     (default-to false (map-get? authorized-operators tx-sender))) ERR_UNAUTHORIZED)
       
-      ;; Check subscription exists
-      (asserts! (is-some (map-get? subscriptions subscriber)) ERR_NO_SUBSCRIPTION)
-      
       ;; Remove subscription
-      (map-delete subscriptions subscriber)
+      (map-delete subscriptions subscription-id)
+      (map-delete subscription-index { subscriber: subscriber, receiver: receiver })
       
       ;; Update user subscription count
       (if (> current-count u0)
@@ -236,23 +256,27 @@
         true)
       
       ;; Clean up rate change history
-      (map-delete rate-change-history subscriber)
+      (map-delete rate-change-history subscription-id)
       
       ;; Log event
-      (log-subscription-cancelled subscriber tx-sender)
+      (log-subscription-cancelled subscription-id subscriber tx-sender)
       (log-security-event "admin-cancellation" "subscription-cancelled-by-admin")
       
       (ok true))))
 
 ;; Enhanced user function to cancel own subscription
-(define-public (cancel-subscription)
-  (let ((current-count (default-to u0 (map-get? user-subscription-count tx-sender))))
+(define-public (cancel-subscription (subscription-id uint))
+  (let ((sub (unwrap! (map-get? subscriptions subscription-id) ERR_NO_SUBSCRIPTION))
+        (subscriber (get subscriber sub))
+        (receiver (get receiver sub))
+        (current-count (default-to u0 (map-get? user-subscription-count tx-sender))))
     (begin
-      ;; Check subscription exists
-      (asserts! (is-some (map-get? subscriptions tx-sender)) ERR_NO_SUBSCRIPTION)
+      ;; Ensure caller owns the subscription
+      (asserts! (is-eq subscriber tx-sender) ERR_UNAUTHORIZED)
       
       ;; Remove subscription
-      (map-delete subscriptions tx-sender)
+      (map-delete subscriptions subscription-id)
+      (map-delete subscription-index { subscriber: subscriber, receiver: receiver })
       
       ;; Update user subscription count
       (if (> current-count u0)
@@ -260,19 +284,27 @@
         true)
       
       ;; Clean up rate change history
-      (map-delete rate-change-history tx-sender)
+      (map-delete rate-change-history subscription-id)
       
       ;; Log event
-      (log-subscription-cancelled tx-sender tx-sender)
+      (log-subscription-cancelled subscription-id tx-sender tx-sender)
       
       (ok true))))
 
 ;; Read-only functions (original)
-(define-read-only (get-subscription (subscriber principal))
-  (map-get? subscriptions subscriber))
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions subscription-id))
 
-(define-read-only (is-subscription-active (subscriber principal))
-  (match (map-get? subscriptions subscriber)
+(define-read-only (get-subscription-id (subscriber principal) (receiver principal))
+  (map-get? subscription-index { subscriber: subscriber, receiver: receiver }))
+
+(define-read-only (get-subscription-by-receiver (subscriber principal) (receiver principal))
+  (match (map-get? subscription-index { subscriber: subscriber, receiver: receiver })
+    subscription-id (map-get? subscriptions subscription-id)
+    none))
+
+(define-read-only (is-subscription-active (subscription-id uint))
+  (match (map-get? subscriptions subscription-id)
     sub-val (> (get expiry sub-val) stacks-block-height)
     false))
 
@@ -301,16 +333,18 @@
 (define-read-only (get-total-volume)
   (var-get total-volume))
 
-(define-read-only (can-change-rate (user principal))
-  (let ((last-change (default-to u0 (map-get? rate-change-history user))))
-    (>= stacks-block-height (+ last-change RATE_CHANGE_COOLDOWN))))
+(define-read-only (can-change-rate (subscription-id uint))
+  (match (map-get? rate-change-history subscription-id)
+    last-change (>= stacks-block-height (+ last-change RATE_CHANGE_COOLDOWN))
+    true))
 
-(define-read-only (get-rate-change-cooldown-remaining (user principal))
-  (let ((last-change (default-to u0 (map-get? rate-change-history user)))
-        (cooldown-end (+ last-change RATE_CHANGE_COOLDOWN)))
-    (if (>= stacks-block-height cooldown-end)
-      u0
-      (- cooldown-end stacks-block-height))))
+(define-read-only (get-rate-change-cooldown-remaining (subscription-id uint))
+  (match (map-get? rate-change-history subscription-id)
+    last-change (let ((cooldown-end (+ last-change RATE_CHANGE_COOLDOWN)))
+                  (if (>= stacks-block-height cooldown-end)
+                    u0
+                    (- cooldown-end stacks-block-height)))
+    u0))
 
 (define-read-only (get-subscription-limits)
   {
